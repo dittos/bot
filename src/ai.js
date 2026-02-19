@@ -209,6 +209,9 @@ export async function createAiResponse(context, options = {}) {
   const body = {
     model: effectiveModel,
     instructions: botConfig.systemPrompt,
+    tools: [
+      { type: "web_search" },
+    ],
     input: toResponsesInput(context),
     store: false,
     stream: true
