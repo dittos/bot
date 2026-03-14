@@ -39,18 +39,40 @@ export async function startSlackBot(config, options) {
     return event.channel_type === "im";
   }
 
+  const slackMaxLength = 20000;
+
   function toSlackText(text = "") {
     const trimmed = text.trim();
-    const maxLength = 39000;
     if (!trimmed) {
       return ".";
     }
 
-    if (trimmed.length <= maxLength) {
+    if (trimmed.length <= slackMaxLength) {
       return trimmed;
     }
 
-    return `${trimmed.slice(0, maxLength - 16)}\n\n...(truncated)`;
+    return trimmed.slice(0, slackMaxLength);
+  }
+
+  function splitSlackText(text = "") {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return ["."];
+    }
+
+    if (trimmed.length <= slackMaxLength) {
+      return [trimmed];
+    }
+
+    const chunks = [];
+    for (let i = 0; i < trimmed.length; i += slackMaxLength) {
+      chunks.push(trimmed.slice(i, i + slackMaxLength));
+    }
+    return chunks;
+  }
+
+  function isMsgTooLong(error) {
+    return error?.data?.error === "msg_too_long";
   }
 
   async function buildThreadContext(client, event) {
@@ -141,6 +163,32 @@ export async function startSlackBot(config, options) {
     const inDm = isDirectMessage(event) && !event.thread_ts;
     let addedEyesReaction = false;
     let pendingUpdate = null;
+    let streamedText = "";
+    let currentMsgOffset = 0;
+
+    const postMessage = async (text) => {
+      const content = toSlackText(text);
+      try {
+        return await client.chat.postMessage({
+          channel: event.channel,
+          ...(inDm ? {} : { thread_ts: threadTs }),
+          text: content,
+          parse: "none",
+          mrkdwn: true
+        });
+      } catch (error) {
+        if (!isMsgTooLong(error)) {
+          throw error;
+        }
+        return await client.chat.postMessage({
+          channel: event.channel,
+          ...(inDm ? {} : { thread_ts: threadTs }),
+          text: content.slice(0, Math.floor(content.length / 2)) || ".",
+          parse: "none",
+          mrkdwn: true
+        });
+      }
+    };
 
     try {
       try {
@@ -164,8 +212,6 @@ export async function startSlackBot(config, options) {
         });
         return;
       }
-
-      let streamedText = "";
       let lastUpdateAt = 0;
 
       const updateReply = async (text, force = false) => {
@@ -178,13 +224,31 @@ export async function startSlackBot(config, options) {
           return;
         }
 
-        await client.chat.update({
-          channel: event.channel,
-          ts: replyTs,
-          text: toSlackText(text),
-          parse: "none",
-          mrkdwn: true
-        });
+        const content = toSlackText(text);
+        try {
+          await client.chat.update({
+            channel: event.channel,
+            ts: replyTs,
+            text: content,
+            parse: "none",
+            mrkdwn: true
+          });
+        } catch (error) {
+          if (!isMsgTooLong(error)) {
+            throw error;
+          }
+          const mid = Math.floor(content.length / 2);
+          await client.chat.update({
+            channel: event.channel,
+            ts: replyTs,
+            text: content.slice(0, mid) || ".",
+            parse: "none",
+            mrkdwn: true
+          });
+          currentMsgOffset += mid;
+          const reply = await postMessage(content.slice(mid));
+          replyTs = reply.ts;
+        }
         lastUpdateAt = now;
       };
 
@@ -196,7 +260,7 @@ export async function startSlackBot(config, options) {
         pendingUpdate = setTimeout(async () => {
           pendingUpdate = null;
           try {
-            await updateReply(streamedText, true);
+            await updateReply(streamedText.slice(currentMsgOffset), true);
           } catch (error) {
             console.error("[slack][message_update] error", error);
           }
@@ -210,21 +274,29 @@ export async function startSlackBot(config, options) {
           systemPrompt: config.systemPrompt,
           onDelta: async (_delta, fullText) => {
             streamedText = fullText;
-            if (!replyTs && streamedText.trim()) {
-              const reply = await client.chat.postMessage({
-                channel: event.channel,
-                ...(inDm ? {} : { thread_ts: threadTs }),
-                text: toSlackText(streamedText),
-                parse: "none",
-                mrkdwn: true
-              });
+            const currentText = streamedText.slice(currentMsgOffset);
+
+            if (!replyTs && currentText.trim()) {
+              const reply = await postMessage(currentText);
               replyTs = reply.ts;
               lastUpdateAt = Date.now();
               return;
             }
 
+            if (currentText.length > slackMaxLength && replyTs) {
+              await updateReply(currentText, true);
+              currentMsgOffset += slackMaxLength;
+              const overflowText = streamedText.slice(currentMsgOffset);
+              if (overflowText.trim()) {
+                const reply = await postMessage(overflowText);
+                replyTs = reply.ts;
+                lastUpdateAt = Date.now();
+              }
+              return;
+            }
+
             if (Date.now() - lastUpdateAt >= slackStreamUpdateMs) {
-              await updateReply(streamedText, true);
+              await updateReply(currentText, true);
             } else {
               scheduleUpdate();
             }
@@ -237,29 +309,53 @@ export async function startSlackBot(config, options) {
       }
 
       const finalText = answer || streamedText || "응답을 생성하지 못했어요.";
+      const remainingText = currentMsgOffset > 0
+        ? streamedText.slice(currentMsgOffset)
+        : finalText;
+      const finalChunks = splitSlackText(remainingText);
+
       if (replyTs) {
-        await updateReply(finalText, true);
+        await updateReply(finalChunks[0], true);
       } else {
-        const reply = await client.chat.postMessage({
-          channel: event.channel,
-          ...(inDm ? {} : { thread_ts: threadTs }),
-          text: toSlackText(finalText),
-          parse: "none",
-          mrkdwn: true
-        });
+        const reply = await postMessage(finalChunks[0]);
         replyTs = reply.ts;
+      }
+
+      for (let i = 1; i < finalChunks.length; i++) {
+        await postMessage(finalChunks[i]);
       }
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
       if (replyTs) {
-        await client.chat.update({
-          channel: event.channel,
-          ts: replyTs,
-          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
-          parse: "none",
-          mrkdwn: true
-        });
+        const errorSuffix = "\n\n⚠️ 출력 중 에러가 발생했습니다.";
+        let errorText;
+        const currentStreamedText = streamedText.slice(currentMsgOffset);
+        if (currentStreamedText.trim()) {
+          const maxContent = slackMaxLength - errorSuffix.length;
+          errorText = currentStreamedText.trim().slice(0, maxContent) + errorSuffix;
+        } else {
+          errorText = "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
+        }
+        try {
+          await client.chat.update({
+            channel: event.channel,
+            ts: replyTs,
+            text: errorText,
+            parse: "none",
+            mrkdwn: true
+          });
+        } catch (updateError) {
+          if (isMsgTooLong(updateError)) {
+            await client.chat.update({
+              channel: event.channel,
+              ts: replyTs,
+              text: errorText.slice(0, Math.floor(errorText.length / 2)) || ".",
+              parse: "none",
+              mrkdwn: true
+            });
+          }
+        }
         return;
       }
 
