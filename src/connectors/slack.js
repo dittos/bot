@@ -40,6 +40,14 @@ export async function startSlackBot(config, options) {
   }
 
   const slackMaxLength = 20000;
+  const slackRateLimitRetryCount = 3;
+  const defaultSlackRetryAfterMs = 10_000;
+
+  function sleep(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
 
   function toSlackText(text = "") {
     if (!text.trim()) {
@@ -73,13 +81,56 @@ export async function startSlackBot(config, options) {
     return error?.data?.error === "msg_too_long";
   }
 
+  function isRateLimited(error) {
+    return (
+      error?.statusCode === 429 ||
+      error?.data?.error === "ratelimited" ||
+      typeof error?.data?.retryAfter === "number" ||
+      typeof error?.retryAfter === "number" ||
+      typeof error?.headers?.["retry-after"] !== "undefined" ||
+      String(error?.message || "").toLowerCase().includes("rate limit")
+    );
+  }
+
+  function getRetryAfterMs(error) {
+    const retryAfter =
+      Number(error?.data?.retryAfter) ||
+      Number(error?.retryAfter) ||
+      Number(error?.headers?.["retry-after"]);
+
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      return retryAfter * 1000;
+    }
+
+    return defaultSlackRetryAfterMs;
+  }
+
+  async function withSlackRetry(action, label, maxAttempts = slackRateLimitRetryCount) {
+    let attempt = 0;
+
+    while (true) {
+      try {
+        return await action();
+      } catch (error) {
+        attempt += 1;
+        if (!isRateLimited(error) || attempt >= maxAttempts) {
+          throw error;
+        }
+
+        const retryAfterMs = getRetryAfterMs(error);
+        console.warn(`[slack][${label}] rate limited, retrying in ${Math.ceil(retryAfterMs / 1000)}s`);
+        await sleep(retryAfterMs);
+      }
+    }
+  }
+
   async function buildThreadContext(client, event) {
     if (isDirectMessage(event) && !event.thread_ts) {
       try {
-        const history = await client.conversations.history({
+        const history = await withSlackRetry(() => client.conversations.history({
           channel: event.channel,
           limit: maxThreadHistory
-        });
+        }), "conversations_history");
 
         const messages = [...(history.messages || [])].reverse();
         const context = [];
@@ -112,11 +163,11 @@ export async function startSlackBot(config, options) {
     }
 
     const threadTs = event.thread_ts || event.ts;
-    const replies = await client.conversations.replies({
+    const replies = await withSlackRetry(() => client.conversations.replies({
       channel: event.channel,
       ts: threadTs,
       limit: maxThreadHistory
-    });
+    }), "conversations_replies");
 
     const messages = replies.messages || [];
     const context = [];
@@ -144,11 +195,11 @@ export async function startSlackBot(config, options) {
       return false;
     }
 
-    const replies = await client.conversations.replies({
+    const replies = await withSlackRetry(() => client.conversations.replies({
       channel: event.channel,
       ts: event.thread_ts,
       limit: maxThreadHistory
-    });
+    }), "thread_replies");
 
     return (replies.messages || []).some(
       (message) => botUserId && message.user === botUserId && message.ts !== event.ts
@@ -163,14 +214,15 @@ export async function startSlackBot(config, options) {
     let pendingUpdate = null;
     let streamedText = "";
     let currentMsgOffset = 0;
+    let syncInFlight = Promise.resolve();
 
     try {
       try {
-        await client.reactions.add({
+        await withSlackRetry(() => client.reactions.add({
           channel: event.channel,
           timestamp: event.ts,
           name: "eyes"
-        });
+        }), "reaction_add");
         addedEyesReaction = true;
       } catch (error) {
         console.error("[slack][reaction_add] skipped", error?.data || error);
@@ -180,10 +232,10 @@ export async function startSlackBot(config, options) {
       const lastUserMessage = [...context].reverse().find((msg) => msg.role === "user");
 
       if (!lastUserMessage) {
-        await say({
+        await withSlackRetry(() => say({
           text: "질문을 같이 보내주세요. 예: `@bot 오늘 할 일 정리해줘`",
           thread_ts: event.thread_ts || event.ts
-        });
+        }), "prompt_say");
         return;
       }
       let lastUpdateAt = 0;
@@ -191,13 +243,13 @@ export async function startSlackBot(config, options) {
       const postMessage = async (text) => {
         const content = toSlackText(text);
         try {
-          const reply = await client.chat.postMessage({
+          const reply = await withSlackRetry(() => client.chat.postMessage({
             channel: event.channel,
             ...(inDm ? {} : { thread_ts: threadTs }),
             text: content,
             parse: "none",
             mrkdwn: true
-          });
+          }), "post_message");
           return { reply, consumedLength: content === "." ? 0 : content.length };
         } catch (error) {
           if (!isMsgTooLong(error) || content.length <= 1) {
@@ -205,13 +257,13 @@ export async function startSlackBot(config, options) {
           }
 
           const consumedLength = Math.floor(content.length / 2);
-          const reply = await client.chat.postMessage({
+          const reply = await withSlackRetry(() => client.chat.postMessage({
             channel: event.channel,
             ...(inDm ? {} : { thread_ts: threadTs }),
             text: content.slice(0, consumedLength) || ".",
             parse: "none",
             mrkdwn: true
-          });
+          }), "post_message");
           return { reply, consumedLength };
         }
       };
@@ -228,13 +280,13 @@ export async function startSlackBot(config, options) {
 
         const content = toSlackText(text);
         try {
-          await client.chat.update({
+          await withSlackRetry(() => client.chat.update({
             channel: event.channel,
             ts: replyTs,
             text: content,
             parse: "none",
             mrkdwn: true
-          });
+          }), "chat_update");
           lastUpdateAt = now;
           return content === "." ? 0 : content.length;
         } catch (error) {
@@ -247,13 +299,13 @@ export async function startSlackBot(config, options) {
           }
 
           const consumedLength = Math.floor(content.length / 2);
-          await client.chat.update({
+          await withSlackRetry(() => client.chat.update({
             channel: event.channel,
             ts: replyTs,
             text: content.slice(0, consumedLength) || ".",
             parse: "none",
             mrkdwn: true
-          });
+          }), "chat_update");
           lastUpdateAt = now;
           return consumedLength;
         }
@@ -286,6 +338,12 @@ export async function startSlackBot(config, options) {
         }
       };
 
+      const runSyncReply = async (force = false) => {
+        const nextSync = syncInFlight.then(() => syncReply(force));
+        syncInFlight = nextSync.catch(() => undefined);
+        return nextSync;
+      };
+
       const scheduleUpdate = () => {
         if (pendingUpdate) {
           return;
@@ -294,7 +352,7 @@ export async function startSlackBot(config, options) {
         pendingUpdate = setTimeout(async () => {
           pendingUpdate = null;
           try {
-            await syncReply(true);
+            await runSyncReply(true);
           } catch (error) {
             console.error("[slack][message_update] error", error);
           }
@@ -311,12 +369,20 @@ export async function startSlackBot(config, options) {
             const currentText = streamedText.slice(currentMsgOffset);
 
             if (!replyTs || currentText.length > slackMaxLength) {
-              await syncReply(true);
+              if (pendingUpdate) {
+                clearTimeout(pendingUpdate);
+                pendingUpdate = null;
+              }
+              await runSyncReply(true);
               return;
             }
 
             if (Date.now() - lastUpdateAt >= slackStreamUpdateMs) {
-              await syncReply(true);
+              if (pendingUpdate) {
+                clearTimeout(pendingUpdate);
+                pendingUpdate = null;
+              }
+              await runSyncReply(true);
             } else {
               scheduleUpdate();
             }
@@ -329,7 +395,7 @@ export async function startSlackBot(config, options) {
       }
 
       streamedText = answer || streamedText || "응답을 생성하지 못했어요.";
-      await syncReply(true);
+      await runSyncReply(true);
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
@@ -344,43 +410,43 @@ export async function startSlackBot(config, options) {
           errorText = "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
         }
         try {
-          await client.chat.update({
+          await withSlackRetry(() => client.chat.update({
             channel: event.channel,
             ts: replyTs,
             text: errorText,
             parse: "none",
             mrkdwn: true
-          });
+          }), "error_update");
         } catch (updateError) {
           if (isMsgTooLong(updateError)) {
-            await client.chat.update({
+            await withSlackRetry(() => client.chat.update({
               channel: event.channel,
               ts: replyTs,
               text: errorText.slice(0, Math.floor(errorText.length / 2)) || ".",
               parse: "none",
               mrkdwn: true
-            });
+            }), "error_update");
           }
         }
         return;
       }
 
       if (inDm) {
-        await client.chat.postMessage({
+        await withSlackRetry(() => client.chat.postMessage({
           channel: event.channel,
           text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
           parse: "none",
           mrkdwn: true
-        });
+        }), "error_post_message");
         return;
       }
 
-      await say({
+      await withSlackRetry(() => say({
         text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
         thread_ts: threadTs,
         parse: "none",
         mrkdwn: true
-      });
+      }), "error_say");
     } finally {
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
@@ -389,11 +455,11 @@ export async function startSlackBot(config, options) {
 
       if (addedEyesReaction) {
         try {
-          await client.reactions.remove({
+          await withSlackRetry(() => client.reactions.remove({
             channel: event.channel,
             timestamp: event.ts,
             name: "eyes"
-          });
+          }), "reaction_remove");
         } catch (error) {
           console.error("[slack][reaction_remove] skipped", error?.data || error);
         }
@@ -456,7 +522,7 @@ export async function startSlackBot(config, options) {
     console.error("[slack][app_error]", error);
   });
 
-  const auth = await app.client.auth.test({ token: config.botToken });
+  const auth = await withSlackRetry(() => app.client.auth.test({ token: config.botToken }), "auth_test");
   botUserId = auth.user_id || null;
   await app.start();
   console.log(
