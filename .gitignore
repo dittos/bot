@@ -7,6 +7,8 @@ config/bot.config.json
 .env.*
 !.env.example
 config/services.json
+config/codex-refresh-token
+config/codex-refresh-token*
 
 # logs
 npm-debug.log*

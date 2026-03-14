@@ -5,7 +5,7 @@
 - Slack: 멘션/스레드/DM 대응
 - Discord: 멘션/DM 대응
 - IRC: 채널 멘션/DM 대응
-- AI 호출 인증은 환경변수만 사용 (`CODEX_REFRESH_TOKEN`)
+- AI 호출 인증은 `CODEX_REFRESH_TOKEN` 기반이며, 필요하면 회전된 토큰을 파일로 영속화할 수 있습니다.
 
 ## 1) 로컬 CLI로 먼저 테스트
 
@@ -23,7 +23,12 @@ CLI 명령:
 인증 환경변수:
 
 - `CODEX_REFRESH_TOKEN`: access token 자동 갱신에 사용 (required)
+- `CODEX_REFRESH_TOKEN_FILE`: refresh token rotation 결과를 저장할 파일 경로 (optional, 재시작 환경 권장)
 - account id 헤더는 refresh 응답의 토큰 클레임에서 자동 추출
+
+Kubernetes처럼 재시작이 발생하는 환경에서는 refresh token이 1회 사용 후 회전되므로,
+기본 Helm 차트는 `/app/data/codex-refresh-token` 경로를 PVC에 저장하도록 구성되어 있습니다.
+직접 실행할 때도 `CODEX_REFRESH_TOKEN_FILE`을 writable persistent volume 경로로 맞추면 이전 토큰 재사용 오류를 피할 수 있습니다.
 
 ## 2) 서비스 설정 파일
 
